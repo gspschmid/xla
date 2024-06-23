@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/pjrt/distributed/in_memory_key_value_store.h"
 #include "xla/pjrt/gpu/gpu_topology.h"
 #include "xla/pjrt/host_memory_spaces.h"
+#include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
@@ -781,6 +782,32 @@ TEST(StreamExecutorGpuClientTest, MockNcclClientTest) {
   }
 }
 
+TEST(StreamExecutorGpuClientTest, BufferFromHostBufferPinnedMemory) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          GetStreamExecutorGpuClient(GpuClientOptions()));
+  std::vector<int32_t> data{1, 2, 3, 4};
+  Shape shape = ShapeUtil::MakeShape(S32, {4});
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto* pinned_memory_space,
+      client->addressable_devices()[0]->memory_space_by_kind(
+          PinnedHostMemorySpace::kKind));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto buffer,
+      client->BufferFromHostBuffer(
+          data.data(), shape.element_type(), shape.dimensions(),
+          /*byte_strides=*/std::nullopt,
+          PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall, nullptr,
+          pinned_memory_space, /*device_layout=*/nullptr));
+
+  EXPECT_EQ(buffer->memory_space()->kind(), "pinned_host");
+  EXPECT_TRUE(buffer->IsOnCpu());
+
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteralSync());
+  std::vector<int32_t> expected{1, 2, 3, 4};
+  EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR1<int32_t>(expected),
+                                     *literal));
+}
+
 namespace {
 
 absl::StatusOr<std::unique_ptr<PjRtBuffer>> CreateDeviceBufferForTest(
@@ -800,24 +827,35 @@ absl::StatusOr<std::unique_ptr<PjRtBuffer>> CreateDeviceBufferForTest(
   return input;
 }
 
+constexpr char const* kD2HProgram = R"(
+  HloModule f
+
+  ENTRY main.5 {
+    p = s32[4]{0} parameter(0)
+    ROOT cc = s32[4] custom-call(p),
+        custom_call_target="annotate_device_placement",
+        frontend_attributes={_xla_buffer_placement="pinned_host"}
+  }
+)";
+
+constexpr char const* kD2HProgramTupleOutput = R"(
+  HloModule f
+
+  ENTRY main.5 {
+    p = s32[4]{0} parameter(0)
+    cc = s32[4] custom-call(p),
+        custom_call_target="annotate_device_placement",
+        frontend_attributes={_xla_buffer_placement="pinned_host"}
+    ROOT tuple = (s32[4]{0}, s32[4]{0}) tuple(s32[4]{0} p, s32[4]{0} cc)
+  }
+)";
+
 }  // namespace
 
 TEST(StreamExecutorGpuClientTest, ExecutePinnedHostOutputTest) {
   TF_ASSERT_OK_AND_ASSIGN(auto client,
                           GetStreamExecutorGpuClient(GpuClientOptions()));
   TF_ASSERT_OK_AND_ASSIGN(auto input, CreateDeviceBufferForTest(client.get()));
-
-  static constexpr char const* kD2HProgram = R"(
-    HloModule f
-
-    ENTRY main.5 {
-      p = s32[4]{0} parameter(0)
-      ROOT cc = s32[4] custom-call(p),
-          custom_call_target="annotate_device_placement",
-          frontend_attributes={_xla_buffer_placement="pinned_host"}
-    }
-  )";
-
   TF_ASSERT_OK_AND_ASSIGN(auto executable,
                           CompileExecutable(kD2HProgram, *client));
   TF_ASSERT_OK_AND_ASSIGN(
@@ -837,18 +875,6 @@ TEST(StreamExecutorGpuClientTest, ExecutePinnedHostOutputTupleTest) {
                           GetStreamExecutorGpuClient(GpuClientOptions()));
   TF_ASSERT_OK_AND_ASSIGN(auto input, CreateDeviceBufferForTest(client.get()));
 
-  static constexpr char const* kD2HProgram = R"(
-    HloModule f
-
-    ENTRY main.5 {
-      p = s32[4]{0} parameter(0)
-      cc = s32[4] custom-call(p),
-          custom_call_target="annotate_device_placement",
-          frontend_attributes={_xla_buffer_placement="pinned_host"}
-      ROOT tuple = (s32[4]{0}, s32[4]{0}) tuple(s32[4]{0} p, s32[4]{0} cc)
-    }
-  )";
-
   // Build the output shape with the correct memory space set.
   Shape host_shape = input->on_device_shape();
   host_shape.mutable_layout()->set_memory_space(Layout::kHostMemorySpace);
@@ -860,8 +886,9 @@ TEST(StreamExecutorGpuClientTest, ExecutePinnedHostOutputTupleTest) {
   xla::CompileOptions options;
   options.executable_build_options.set_result_layout(out_shape);
 
-  TF_ASSERT_OK_AND_ASSIGN(auto executable,
-                          CompileExecutable(kD2HProgram, *client, options));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto executable,
+      CompileExecutable(kD2HProgramTupleOutput, *client, options));
 
   // Untuple the result so that we get separate buffers.
   // This is how JAX invokes XLA.
@@ -874,6 +901,82 @@ TEST(StreamExecutorGpuClientTest, ExecutePinnedHostOutputTupleTest) {
   EXPECT_EQ(result_buffers.size(), 2);
   EXPECT_EQ(result_buffers[0]->memory_space()->kind(), "device");
   EXPECT_EQ(result_buffers[1]->memory_space()->kind(), "pinned_host");
+}
+
+TEST(StreamExecutorGpuClientTest, MlirParameterHostMemorySpaceIsSetInHlo) {
+  constexpr char kMlirH2D[] =
+      R"(
+    func.func public @main(%arg0: tensor<8x2xi32> {
+            mhlo.layout_mode = "{1,0}",
+            mhlo.memory_kind = "pinned_host",
+            mhlo.sharding = "{devices=[2,2]<=[4]}"
+        }) -> (tensor<8x2xi32> {
+            jax.result_info = "",
+            mhlo.layout_mode = "default",
+            mhlo.memory_kind = "device",
+            mhlo.sharding = "{devices=[2,2]<=[4]}"}) {
+      %0 = stablehlo.custom_call @annotate_device_placement(%arg0) {
+              has_side_effect = true,
+              mhlo.frontend_attributes = {_xla_buffer_placement = "device"}
+          } : (tensor<8x2xi32>) -> tensor<8x2xi32>
+      return %0 : tensor<8x2xi32>
+    }
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          GetStreamExecutorGpuClient(GpuClientOptions()));
+
+  mlir::MLIRContext context;
+  TF_ASSIGN_OR_RETURN(auto module,
+                      xla::ParseMlirModuleString(kMlirH2D, context));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto executable, client->Compile(*module, {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto modules, executable->GetHloModules());
+
+  auto first_param_layout =
+      modules[0]->entry_computation_layout().parameter_layout(0).layout();
+  EXPECT_EQ(first_param_layout.memory_space(), Layout::kHostMemorySpace);
+  auto result_layout =
+      modules[0]->entry_computation_layout().result_layout().layout();
+  EXPECT_EQ(result_layout.memory_space(), Layout::kDefaultMemorySpace);
+}
+
+TEST(StreamExecutorGpuClientTest, MlirResultHostMemorySpaceIsSetInHlo) {
+  constexpr char kMlirD2H[] =
+      R"(
+    func.func public @main(%arg0: tensor<8x2xi32> {
+            mhlo.layout_mode = "{1,0}",
+            mhlo.memory_kind = "device",
+            mhlo.sharding = "{devices=[2,2]<=[4]}"
+        }) -> (tensor<8x2xi32> {
+            jax.result_info = "",
+            mhlo.layout_mode = "default",
+            mhlo.memory_kind = "pinned_host",
+            mhlo.sharding = "{devices=[2,2]<=[4]}"}) {
+      %0 = stablehlo.custom_call @annotate_device_placement(%arg0) {
+              has_side_effect = true,
+              mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}
+          } : (tensor<8x2xi32>) -> tensor<8x2xi32>
+      return %0 : tensor<8x2xi32>
+    }
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          GetStreamExecutorGpuClient(GpuClientOptions()));
+
+  mlir::MLIRContext context;
+  TF_ASSIGN_OR_RETURN(auto module,
+                      xla::ParseMlirModuleString(kMlirD2H, context));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto executable, client->Compile(*module, {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto modules, executable->GetHloModules());
+
+  auto first_param_layout =
+      modules[0]->entry_computation_layout().parameter_layout(0).layout();
+  EXPECT_EQ(first_param_layout.memory_space(), Layout::kDefaultMemorySpace);
+  auto result_layout =
+      modules[0]->entry_computation_layout().result_layout().layout();
+  EXPECT_EQ(result_layout.memory_space(), Layout::kHostMemorySpace);
 }
 
 }  // namespace
