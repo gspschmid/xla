@@ -986,13 +986,11 @@ void StreamExecutorGpuClient::CopyToRemoteDevice(
   // Acquire a hold on the buffer.
   auto* handle = tensorflow::down_cast<PjRtStreamExecutorBuffer*>(buffer);
   PjRtStreamExecutorBuffer::ScopedHold hold = handle->GetBufferWithUsageHold();
-  se::Stream* stream = (*local_device)->compute_stream();
 
   auto send = [gpu_collectives, clique_id, on_done, mem = hold->device_memory(),
                local_device = *local_device, shape = *shape,
                dtype = buffer->element_type(),
-              //  stream = (*local_device)->GetDeviceToDeviceStream()]() mutable {
-               stream]() mutable {
+               stream = (*local_device)->GetDeviceToDeviceStream()]() mutable {
     auto f = [&]() -> absl::Status {
       // Create a communicator.
       //
@@ -1041,8 +1039,7 @@ void StreamExecutorGpuClient::CopyToRemoteDevice(
       on_done(absl::OkStatus(), /*sends_were_enqueued=*/true);
     }
   };
-  // thread_pool()->Schedule(send);
-  send();
+  send();  // enqueue immediately
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
@@ -1077,8 +1074,7 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
   TF_ASSIGN_OR_RETURN(LocalDeviceState * local_device,
                       tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
                           ->GetLocalDeviceState());
-  // se::Stream* stream = local_device->GetDeviceToDeviceStream();
-  se::Stream* stream = local_device->compute_stream();
+  se::Stream* stream = local_device->GetDeviceToDeviceStream();
   BufferSequencingEventRef definition_event =
       BufferSequencingEvent::Create(this->thread_pool());
   TF_ASSIGN_OR_RETURN(
@@ -1158,8 +1154,7 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
       SetEventAsError(definition_event, s);
     }
   };
-  // thread_pool()->Schedule(recv);
-  recv();
+  recv();  // enqueue immediately
 
   std::vector<std::unique_ptr<PjRtBuffer>> buffers;
   buffers.push_back(std::move(buffer));
