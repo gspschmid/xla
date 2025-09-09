@@ -115,6 +115,9 @@ inline BufferAssigner::Colorer CollectiveColorer(bool use_user_buffers,
           value->set_color(BufferValue::Color(memory_space));
           continue;
         }
+      } else {
+        value->set_color(0);
+        continue;
       }
 
       auto& buffer = alias_analysis->GetBufferContainingValue(*value);
